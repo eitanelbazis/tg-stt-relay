@@ -97,6 +97,4 @@ app.use((err, _req, res, _next) => {
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => {
-  console.log(`stt relay listening on ${port}`);
-});
+app.listen(port, () => { console.log(`stt relay listening on ${port}`); });
