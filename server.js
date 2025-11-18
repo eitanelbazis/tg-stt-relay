@@ -1,3 +1,4 @@
+console.log('boot', { dryRun: process.env.DRY_RUN || '0', node: process.version });
 require('dotenv').config();
 const express = require('express');
 const multer = require('multer');
