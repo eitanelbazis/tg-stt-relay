@@ -1,9 +1,8 @@
-console.log('boot', { dryRun: process.env.DRY_RUN || '0', node: process.version });
 require('dotenv').config();
 const express = require('express');
-const multer = require('multer');
 const cors = require('cors');
 const morgan = require('morgan');
+const multer = require('multer');
 const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
 const ffmpeg = require('fluent-ffmpeg');
 const { Readable } = require('stream');
@@ -11,16 +10,16 @@ const sdk = require('microsoft-cognitiveservices-speech-sdk');
 
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 
+console.log('boot', { dryRun: process.env.DRY_RUN || '0', node: process.version });
+
 const app = express();
 app.disable('x-powered-by');
 app.use(cors());
 app.use(morgan('tiny'));
 
 app.get('/health', (_req, res) => res.status(200).send('OK'));
-
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 15 * 1024 * 1024, files: 1 },
+app.get('/version', (_req, res) => {
+  res.json({ ok: true, mode: process.env.DRY_RUN === '1' ? 'DRY_RUN' : 'LIVE', node: process.version, ts: Date.now() });
 });
 
 function withTimeout(promise, ms, label = 'op') {
@@ -39,12 +38,11 @@ async function oggToWav16k(buffer) {
       .audioFrequency(16000)
       .audioCodec('pcm_s16le')
       .format('wav')
-      .on('start', c => console.log('ffmpeg_start', c))
-      .on('error', e => reject(e));
-
+      .on('start', (c) => console.log('ffmpeg_start', c))
+      .on('error', (e) => reject(e));
     const chunks = [];
     const out = cmd.pipe();
-    out.on('data', d => chunks.push(d));
+    out.on('data', (d) => chunks.push(d));
     out.on('end', () => resolve(Buffer.concat(chunks)));
     out.on('error', reject);
   }), 7000, 'ffmpeg');
@@ -68,7 +66,6 @@ function recognizeOnceFromWavBuffer(wavBuffer) {
     const pushStream = sdk.AudioInputStream.createPushStream();
     pushStream.write(wavBuffer);
     pushStream.close();
-
     let recognizer;
     try {
       const speechConfig = makeSpeechConfig();
@@ -77,7 +74,6 @@ function recognizeOnceFromWavBuffer(wavBuffer) {
     } catch (e) {
       return reject(e);
     }
-
     recognizer.recognizeOnceAsync(
       (result) => {
         recognizer.close();
@@ -93,37 +89,40 @@ function recognizeOnceFromWavBuffer(wavBuffer) {
   });
 }
 
-app.post('/stt/telegram', upload.single('voice'), async (req, res, next) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: 'no_file' });
-
-    if (process.env.DRY_RUN === '1') {
-      return res.json({ ok: true, bytes: req.file.size, mimetype: req.file.mimetype });
+// --------- Route mounting ----------
+if (process.env.DRY_RUN === '1') {
+  console.log('route_variant', 'DRY_RUN');
+  // Consume the request stream fully, then respond
+  app.post('/stt/telegram', (req, res) => {
+    let bytes = 0;
+    req.on('data', (c) => { bytes += c.length; });
+    req.on('end', () => res.json({ ok: true, dryRun: true, bytes }));
+    req.on('error', (e) => res.status(400).json({ error: 'read', message: e.message }));
+  });
+} else {
+  console.log('route_variant', 'LIVE');
+  const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024, files: 1 } });
+  app.post('/stt/telegram', upload.single('voice'), async (req, res, next) => {
+    try {
+      if (!req.file) return res.status(400).json({ error: 'no_file' });
+      console.log('convert_start', req.file.mimetype, req.file.size);
+      const wavBuffer = await oggToWav16k(req.file.buffer);
+      console.log('convert_ok', wavBuffer.length);
+      console.log('stt_start');
+      const text = await withTimeout(recognizeOnceFromWavBuffer(wavBuffer), 15000, 'speech');
+      console.log('stt_ok', text.length);
+      const chatId = req.body?.chatId || null;
+      return res.json({ text, chatId });
+    } catch (err) {
+      console.error('stt_route_error', err.message);
+      return next(err);
     }
-
-    console.log('convert_start', req.file.mimetype, req.file.size);
-    const wavBuffer = await oggToWav16k(req.file.buffer);
-    console.log('convert_ok', wavBuffer.length);
-
-    console.log('stt_start');
-    const text = await withTimeout(recognizeOnceFromWavBuffer(wavBuffer), 15000, 'speech');
-    console.log('stt_ok', text.length);
-
-    const chatId = req.body?.chatId || null;
-    return res.json({ text, chatId });
-  } catch (err) {
-    console.error('stt_route_error', err.message);
-    return next(err);
-  }
-});
+  });
+}
 
 app.use((err, _req, res, _next) => {
-  if (err && err.name === 'MulterError') {
-    return res.status(400).json({ error: 'multer', code: err.code, message: err.message });
-  }
-  if (err && err.code === 'missing_azure_env') {
-    return res.status(500).json({ error: 'config', message: 'Missing AZURE_SPEECH_KEY or AZURE_SPEECH_REGION' });
-  }
+  if (err && err.name === 'MulterError') return res.status(400).json({ error: 'multer', code: err.code, message: err.message });
+  if (err && err.code === 'missing_azure_env') return res.status(500).json({ error: 'config', message: 'Missing AZURE_SPEECH_KEY or AZURE_SPEECH_REGION' });
   console.error('unhandled_error', err);
   return res.status(500).json({ error: 'server', message: err?.message || 'internal error' });
 });
