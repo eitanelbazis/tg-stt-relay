@@ -6,7 +6,6 @@ const morgan = require('morgan');
 const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
 const ffmpeg = require('fluent-ffmpeg');
 const { Readable } = require('stream');
-const getStream = require('get-stream');
 const sdk = require('microsoft-cognitiveservices-speech-sdk');
 
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
@@ -23,6 +22,33 @@ const upload = multer({
   limits: { fileSize: 15 * 1024 * 1024, files: 1 },
 });
 
+function withTimeout(promise, ms, label = 'op') {
+  return Promise.race([
+    promise,
+    new Promise((_, rej) => setTimeout(() => rej(new Error(`${label}_timeout`)), ms)),
+  ]);
+}
+
+async function oggToWav16k(buffer) {
+  return await withTimeout(new Promise((resolve, reject) => {
+    const input = Readable.from(buffer);
+    const cmd = ffmpeg()
+      .input(input)
+      .audioChannels(1)
+      .audioFrequency(16000)
+      .audioCodec('pcm_s16le')
+      .format('wav')
+      .on('start', c => console.log('ffmpeg_start', c))
+      .on('error', e => reject(e));
+
+    const chunks = [];
+    const out = cmd.pipe();
+    out.on('data', d => chunks.push(d));
+    out.on('end', () => resolve(Buffer.concat(chunks)));
+    out.on('error', reject);
+  }), 7000, 'ffmpeg');
+}
+
 function makeSpeechConfig() {
   const key = process.env.AZURE_SPEECH_KEY;
   const region = process.env.AZURE_SPEECH_REGION;
@@ -36,24 +62,12 @@ function makeSpeechConfig() {
   return speechConfig;
 }
 
-async function oggToWav16k(buffer) {
-  const input = Readable.from(buffer);
-  const stream = ffmpeg()
-    .input(input)
-    .audioChannels(1)
-    .audioFrequency(16000)
-    .audioCodec('pcm_s16le')
-    .format('wav')
-    .on('error', (e) => { console.error('ffmpeg_error', e); })
-    .pipe();
-  return await getStream.buffer(stream);
-}
-
 function recognizeOnceFromWavBuffer(wavBuffer) {
   return new Promise((resolve, reject) => {
     const pushStream = sdk.AudioInputStream.createPushStream();
     pushStream.write(wavBuffer);
     pushStream.close();
+
     let recognizer;
     try {
       const speechConfig = makeSpeechConfig();
@@ -62,12 +76,13 @@ function recognizeOnceFromWavBuffer(wavBuffer) {
     } catch (e) {
       return reject(e);
     }
+
     recognizer.recognizeOnceAsync(
       (result) => {
         recognizer.close();
-        if (result.reason === sdk.ResultReason.RecognizedSpeech) resolve(result.text || '');
-        else if (result.reason === sdk.ResultReason.NoMatch) resolve('');
-        else reject(new Error(result.errorDetails || 'speech_failed'));
+        if (result.reason === sdk.ResultReason.RecognizedSpeech) return resolve(result.text || '');
+        if (result.reason === sdk.ResultReason.NoMatch) return resolve('');
+        return reject(new Error(result.errorDetails || 'speech_failed'));
       },
       (err) => {
         recognizer.close();
@@ -80,18 +95,34 @@ function recognizeOnceFromWavBuffer(wavBuffer) {
 app.post('/stt/telegram', upload.single('voice'), async (req, res, next) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'no_file' });
-    const chatId = req.body?.chatId || null;
+
+    if (process.env.DRY_RUN === '1') {
+      return res.json({ ok: true, bytes: req.file.size, mimetype: req.file.mimetype });
+    }
+
+    console.log('convert_start', req.file.mimetype, req.file.size);
     const wavBuffer = await oggToWav16k(req.file.buffer);
-    const text = await recognizeOnceFromWavBuffer(wavBuffer);
+    console.log('convert_ok', wavBuffer.length);
+
+    console.log('stt_start');
+    const text = await withTimeout(recognizeOnceFromWavBuffer(wavBuffer), 15000, 'speech');
+    console.log('stt_ok', text.length);
+
+    const chatId = req.body?.chatId || null;
     return res.json({ text, chatId });
   } catch (err) {
+    console.error('stt_route_error', err.message);
     return next(err);
   }
 });
 
 app.use((err, _req, res, _next) => {
-  if (err && err.name === 'MulterError') return res.status(400).json({ error: 'multer', code: err.code, message: err.message });
-  if (err && err.code === 'missing_azure_env') return res.status(500).json({ error: 'config', message: 'Missing AZURE_SPEECH_KEY or AZURE_SPEECH_REGION' });
+  if (err && err.name === 'MulterError') {
+    return res.status(400).json({ error: 'multer', code: err.code, message: err.message });
+  }
+  if (err && err.code === 'missing_azure_env') {
+    return res.status(500).json({ error: 'config', message: 'Missing AZURE_SPEECH_KEY or AZURE_SPEECH_REGION' });
+  }
   console.error('unhandled_error', err);
   return res.status(500).json({ error: 'server', message: err?.message || 'internal error' });
 });
