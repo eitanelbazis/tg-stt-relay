@@ -127,5 +127,7 @@ app.use((err, _req, res, _next) => {
   return res.status(500).json({ error: 'server', message: err?.message || 'internal error' });
 });
 
-const port = process.env.PORT || 3000;
-app.listen(port, () => { console.log(`stt relay listening on ${port}`); });
+const port = process.env.PORT || 8080;
+app.listen(port, '0.0.0.0', () => {
+  console.log(`stt relay listening on ${port}`);
+});
