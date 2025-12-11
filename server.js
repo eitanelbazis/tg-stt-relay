@@ -11,7 +11,7 @@ const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
 console.log('--- SERVER STARTING ---');
 console.log('FFmpeg Path:', ffmpegPath);
 
-// 2. ENSURE UPLOADS DIRECTORY EXISTS (Critical Fix)
+// 2. ENSURE UPLOADS DIRECTORY EXISTS
 const uploadDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) {
   console.log('Uploads directory not found, creating it...');
@@ -23,54 +23,34 @@ const app = express();
 const upload = multer({ dest: uploadDir });
 const port = process.env.PORT || 3000;
 
-// 3. AUTO-CLEANUP OLD FILES (FIX FOR CRASHES)
-const cleanupUploads = () => {
-  try {
-    const files = fs.readdirSync(uploadDir);
-    let cleaned = 0;
-    files.forEach(file => {
-      const filePath = path.join(uploadDir, file);
-      const stats = fs.statSync(filePath);
-      const ageMinutes = (Date.now() - stats.mtime) / 1000 / 60;
-      if (ageMinutes > 5) { // Delete files older than 5 minutes
-        fs.unlinkSync(filePath);
-        cleaned++;
-      }
-    });
-    if (cleaned > 0) {
-      console.log(`[Cleanup] Removed ${cleaned} old files`);
-    }
-  } catch (err) {
-    console.error('[Cleanup] Error:', err.message);
-  }
-};
-
-// Run cleanup every 5 minutes
-setInterval(cleanupUploads, 5 * 60 * 1000);
-cleanupUploads(); // Run once on startup
-
 // Middleware for logging requests
 app.use((req, res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
   next();
 });
 
-// 4. HEALTH CHECK ENDPOINT
+// HEALTH CHECK
 app.get('/health', (req, res) => {
-  const uploadCount = fs.readdirSync(uploadDir).length;
-  res.json({ 
-    status: 'ok',
-    uptime: Math.floor(process.uptime()),
-    memory: Math.floor(process.memoryUsage().heapUsed / 1024 / 1024) + 'MB',
-    tempFiles: uploadCount
-  });
+  res.status(200).json({ status: 'ok', uptime: process.uptime() });
 });
 
-// 5. STT ENDPOINT WITH TIMEOUT & ERROR HANDLING
+// CLEANUP HELPER (called per request, not on interval)
+const cleanupFiles = (inputPath, outputPath) => {
+  try {
+    if (inputPath && fs.existsSync(inputPath)) {
+      fs.unlinkSync(inputPath);
+      console.log('Cleaned:', inputPath);
+    }
+    if (outputPath && fs.existsSync(outputPath)) {
+      fs.unlinkSync(outputPath);
+      console.log('Cleaned:', outputPath);
+    }
+  } catch (e) {
+    console.error('Cleanup warning:', e.message);
+  }
+};
+
 app.post('/stt/telegram', upload.single('voice'), async (req, res) => {
-  // Set request timeout
-  req.setTimeout(25000); // 25 seconds
-  
   console.log('Received POST /stt/telegram');
   let inputPath = null;
   let outputPath = null;
@@ -92,13 +72,19 @@ app.post('/stt/telegram', upload.single('voice'), async (req, res) => {
 
     console.log('Starting FFmpeg conversion...');
     await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error('FFmpeg timeout after 20s'));
+      }, 20000);
+
       ffmpeg(inputPath)
         .toFormat('wav')
         .on('error', (err) => {
+          clearTimeout(timeout);
           console.error('FFmpeg Error:', err);
           reject(err);
         })
         .on('end', () => {
+          clearTimeout(timeout);
           console.log('FFmpeg conversion complete.');
           resolve();
         })
@@ -121,12 +107,7 @@ app.post('/stt/telegram', upload.single('voice'), async (req, res) => {
       console.log('Azure Result Reason:', result.reason);
 
       // Cleanup files immediately
-      try {
-        if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
-        if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
-      } catch (cleanupErr) {
-        console.error('Cleanup warning:', cleanupErr);
-      }
+      cleanupFiles(inputPath, outputPath);
 
       if (result.reason === sdk.ResultReason.RecognizedSpeech) {
         console.log('Transcription:', result.text);
@@ -139,27 +120,14 @@ app.post('/stt/telegram', upload.single('voice'), async (req, res) => {
       recognizer.close();
     }, (err) => {
       console.error('Azure Async Error:', err);
-      
-      // Cleanup on error
-      try {
-        if (inputPath && fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
-        if (outputPath && fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
-      } catch (e) { /* ignore */ }
-      
+      cleanupFiles(inputPath, outputPath);
       res.status(500).json({ error: 'Azure STT failed', message: err.message });
       recognizer.close();
     });
 
   } catch (error) {
     console.error('CRITICAL ERROR (handled):', error);
-    
-    // Attempt cleanup if crash happened mid-process
-    try {
-      if (inputPath && fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
-      if (outputPath && fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
-    } catch (e) { /* ignore cleanup errors */ }
-    
-    // Return friendly error instead of crashing
+    cleanupFiles(inputPath, outputPath);
     res.status(500).json({ 
       error: 'Transcription failed', 
       message: 'Please try again or type your message'
@@ -169,9 +137,4 @@ app.post('/stt/telegram', upload.single('voice'), async (req, res) => {
 
 app.listen(port, () => {
   console.log(`STT Relay listening on port ${port}`);
-});
-
-
-app.listen(port, () => {
-    console.log(`STT Relay listening on port ${port}`);
 });
