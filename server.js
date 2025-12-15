@@ -24,6 +24,8 @@ const app = express();
 const upload = multer({ dest: uploadDir });
 const port = process.env.PORT || 3000;
 
+const SONIOX_API_BASE = 'https://api.soniox.com/v1';
+
 // Middleware for logging requests
 app.use((req, res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
@@ -86,8 +88,8 @@ app.post('/stt/telegram', upload.single('voice'), async (req, res) => {
 
       ffmpeg(inputPath)
         .toFormat('wav')
-        .audioFrequency(16000)  // Soniox requires 16kHz
-        .audioChannels(1)        // Mono
+        .audioFrequency(16000)
+        .audioChannels(1)
         .on('error', (err) => {
           clearTimeout(timeout);
           console.error('FFmpeg Error:', err);
@@ -101,68 +103,108 @@ app.post('/stt/telegram', upload.single('voice'), async (req, res) => {
         .save(outputPath);
     });
 
-    // 2. Prepare multipart form data
-    const formData = new FormData();
-    formData.append('audio', fs.createReadStream(outputPath), {
+    // 2. STEP 1: Upload file to Soniox
+    console.log('Step 1: Uploading file to Soniox...');
+    const uploadForm = new FormData();
+    uploadForm.append('file', fs.createReadStream(outputPath), {
       filename: 'audio.wav',
       contentType: 'audio/wav'
     });
-    formData.append('model', 'enhanced');  // or 'standard' for faster/cheaper
-    formData.append('language', 'he');      // Hebrew
-    formData.append('enable_entities', 'true'); // Converts "עשר וחצי" → "10:30"
 
-    console.log('Sending audio to Soniox API...');
-
-    // 3. Call Soniox API
-    const response = await axios.post(
-      'https://api.soniox.com/v1/transcribe',
-      formData,
+    const uploadResponse = await axios.post(
+      `${SONIOX_API_BASE}/files`,
+      uploadForm,
       {
         headers: {
           'Authorization': `Bearer ${process.env.SONIOX_API_KEY}`,
-          ...formData.getHeaders()
+          ...uploadForm.getHeaders()
         },
-        timeout: 25000  // 25 second timeout
+        timeout: 30000
       }
     );
 
-    console.log('Soniox API Response Status:', response.status);
+    const fileId = uploadResponse.data.id;
+    console.log(`File uploaded successfully. File ID: ${fileId}`);
 
-    // Cleanup files immediately
+    // 3. STEP 2: Create transcription
+    console.log('Step 2: Creating transcription...');
+    const transcriptionResponse = await axios.post(
+      `${SONIOX_API_BASE}/transcriptions`,
+      {
+        model: 'stt-async-he',  // Hebrew async model
+        file_id: fileId
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${process.env.SONIOX_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 10000
+      }
+    );
+
+    const transcriptionId = transcriptionResponse.data.id;
+    console.log(`Transcription created. ID: ${transcriptionId}. Status: ${transcriptionResponse.data.status}`);
+
+    // 4. STEP 3: Poll for completion (max 30 seconds)
+    console.log('Step 3: Polling for transcription completion...');
+    let status = transcriptionResponse.data.status;
+    let attempts = 0;
+    const maxAttempts = 30;
+
+    while (status !== 'completed' && status !== 'error' && attempts < maxAttempts) {
+      await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second
+      attempts++;
+
+      const statusResponse = await axios.get(
+        `${SONIOX_API_BASE}/transcriptions/${transcriptionId}`,
+        {
+          headers: {
+            'Authorization': `Bearer ${process.env.SONIOX_API_KEY}`
+          }
+        }
+      );
+
+      status = statusResponse.data.status;
+      console.log(`Polling attempt ${attempts}: Status = ${status}`);
+    }
+
+    if (status === 'error') {
+      throw new Error('Transcription failed on Soniox side');
+    }
+
+    if (status !== 'completed') {
+      throw new Error(`Transcription timeout after ${maxAttempts} seconds`);
+    }
+
+    // 5. STEP 4: Get transcript
+    console.log('Step 4: Fetching transcript...');
+    const transcriptResponse = await axios.get(
+      `${SONIOX_API_BASE}/transcriptions/${transcriptionId}/transcript`,
+      {
+        headers: {
+          'Authorization': `Bearer ${process.env.SONIOX_API_KEY}`
+        }
+      }
+    );
+
+    const transcription = transcriptResponse.data.text;
+    console.log('Transcription:', transcription);
+
+    // Cleanup files
     cleanupFiles(inputPath, outputPath);
 
-    // 4. Extract transcription
-    if (response.data && response.data.words && response.data.words.length > 0) {
-      // Soniox returns word-level data, concatenate to get full text
-      const transcription = response.data.words.map(w => w.text).join(' ');
-      console.log('Transcription:', transcription);
-
-      res.json({ 
-        text: transcription, 
-        chatId: chatId,
-        provider: 'soniox',
-        confidence: response.data.words[0]?.confidence || null
-      });
-    } else if (response.data && response.data.text) {
-      // Alternative: some responses have direct text field
-      console.log('Transcription:', response.data.text);
-      res.json({ 
-        text: response.data.text, 
-        chatId: chatId,
-        provider: 'soniox'
-      });
-    } else {
-      console.error('No transcription in Soniox response:', response.data);
-      res.status(500).json({ 
-        error: 'No transcription result',
-        details: response.data 
-      });
-    }
+    // Return result
+    res.json({ 
+      text: transcription, 
+      chatId: chatId,
+      provider: 'soniox',
+      transcriptionId: transcriptionId
+    });
 
   } catch (error) {
     console.error('CRITICAL ERROR (handled):', error.message);
     
-    // Log more details if it's an API error
     if (error.response) {
       console.error('Soniox API Error Status:', error.response.status);
       console.error('Soniox API Error Data:', JSON.stringify(error.response.data));
@@ -173,7 +215,7 @@ app.post('/stt/telegram', upload.single('voice'), async (req, res) => {
     res.status(500).json({ 
       error: 'Transcription failed', 
       message: error.message,
-      hint: error.response ? 'Check Soniox API error above' : 'Check if SONIOX_API_KEY is set correctly'
+      hint: error.response ? `Soniox API error: ${error.response.status}` : 'Check if SONIOX_API_KEY is set correctly'
     });
   }
 });
@@ -182,4 +224,3 @@ app.listen(port, () => {
   console.log(`Soniox STT Relay listening on port ${port}`);
   console.log('API Key status:', process.env.SONIOX_API_KEY ? 'Configured ✓' : 'MISSING ✗');
 });
-
