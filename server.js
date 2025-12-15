@@ -9,15 +9,9 @@ const upload = multer({ dest: '/tmp/' });
 const SONIOX_WS_URL = 'wss://api.soniox.com/transcribe-websocket';
 const SONIOX_API_KEY = process.env.SONIOX_API_KEY;
 
-app.post('/stt/telegram', upload.single('voice'), async (req, res) => {
-  const audioPath = req.file.path;
-  const chatId = req.body.chatId || 'unknown';
-
-  try {
-    console.log(`[${chatId}] Starting Soniox real-time transcription...`);
-    
-    const audioBuffer = fs.readFileSync(audioPath);
-    
+// Helper function for Soniox WebSocket transcription
+async function transcribeWithSoniox(audioBuffer, chatId) {
+  return new Promise((resolve, reject) => {
     const ws = new WebSocket(SONIOX_WS_URL, {
       headers: {
         'Authorization': `Basic ${SONIOX_API_KEY}`
@@ -40,7 +34,7 @@ app.post('/stt/telegram', upload.single('voice'), async (req, res) => {
       // Send audio
       ws.send(audioBuffer);
       
-      // Signal end
+      // Signal end of audio
       ws.send(new Uint8Array(0));
     });
 
@@ -48,11 +42,13 @@ app.post('/stt/telegram', upload.single('voice'), async (req, res) => {
       try {
         const response = JSON.parse(data);
         
+        // Extract final words
         if (response.fw && response.fw.length > 0) {
           transcription = response.fw.map(w => w.t).join(' ');
-          console.log(`[${chatId}] Got: "${transcription}"`);
+          console.log(`[${chatId}] Transcribed: "${transcription}"`);
         }
         
+        // Check if complete
         if (response.status === 'completed') {
           isDone = true;
           ws.close();
@@ -63,49 +59,100 @@ app.post('/stt/telegram', upload.single('voice'), async (req, res) => {
     });
 
     ws.on('error', (error) => {
-      console.error(`[${chatId}] WS error:`, error);
-      cleanup();
-      if (!res.headersSent) {
-        res.status(500).json({ error: error.message });
-      }
+      console.error(`[${chatId}] WebSocket error:`, error);
+      reject(error);
     });
 
     ws.on('close', () => {
-      cleanup();
       if (isDone && transcription) {
-        res.json({
-          text: transcription,
-          chatId: chatId,
-          provider: 'soniox-realtime'
-        });
-      } else if (!res.headersSent) {
-        res.status(500).json({ error: 'Transcription incomplete' });
+        resolve(transcription);
+      } else {
+        reject(new Error('Transcription incomplete'));
       }
     });
 
-    const cleanup = () => {
-      try {
-        fs.unlinkSync(audioPath);
-      } catch (e) {}
-    };
-
+    // Timeout after 30 seconds
     setTimeout(() => {
       if (!isDone) {
         ws.close();
-        cleanup();
-        if (!res.headersSent) {
-          res.status(408).json({ error: 'Timeout' });
-        }
+        reject(new Error('Transcription timeout'));
       }
     }, 30000);
+  });
+}
 
+// ============================================
+// ENDPOINT 1: Telegram/WhatsApp Voice Messages
+// ============================================
+app.post('/stt/telegram', upload.single('voice'), async (req, res) => {
+  const audioPath = req.file.path;
+  const chatId = req.body.chatId || 'telegram-unknown';
+
+  try {
+    console.log(`[Telegram ${chatId}] Processing voice message...`);
+    
+    const audioBuffer = fs.readFileSync(audioPath);
+    const transcription = await transcribeWithSoniox(audioBuffer, chatId);
+    
+    // Cleanup
+    fs.unlinkSync(audioPath);
+    
+    res.json({
+      text: transcription,
+      chatId: chatId,
+      provider: 'soniox-realtime',
+      source: 'telegram'
+    });
+    
   } catch (error) {
-    console.error(`[${chatId}] Error:`, error);
+    console.error(`[Telegram ${chatId}] Error:`, error);
+    try { fs.unlinkSync(audioPath); } catch (e) {}
     res.status(500).json({ error: error.message });
   }
 });
 
+// ============================================
+// ENDPOINT 2: Twilio Voice Calls
+// ============================================
+app.post('/stt/twilio', upload.single('file'), async (req, res) => {
+  const audioPath = req.file.path;
+  const callerId = req.body.From || req.body.CallSid || 'twilio-unknown';
+
+  try {
+    console.log(`[Twilio ${callerId}] Processing voice recording...`);
+    
+    const audioBuffer = fs.readFileSync(audioPath);
+    const transcription = await transcribeWithSoniox(audioBuffer, callerId);
+    
+    // Cleanup
+    fs.unlinkSync(audioPath);
+    
+    res.json({
+      text: transcription,
+      chatId: callerId,
+      provider: 'soniox-realtime',
+      source: 'twilio'
+    });
+    
+  } catch (error) {
+    console.error(`[Twilio ${callerId}] Error:`, error);
+    try { fs.unlinkSync(audioPath); } catch (e) {}
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    endpoints: ['/stt/telegram', '/stt/twilio'],
+    timestamp: new Date().toISOString()
+  });
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`✅ Soniox real-time STT running on port ${PORT}`);
+  console.log(`✅ Soniox STT Server running on port ${PORT}`);
+  console.log(`   - Telegram endpoint: /stt/telegram`);
+  console.log(`   - Twilio endpoint: /stt/twilio`);
 });
