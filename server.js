@@ -157,17 +157,22 @@ const transcriptionResponse = await axios.post(
       await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second
       attempts++;
 
-      const statusResponse = await axios.get(
-        `${SONIOX_API_BASE}/transcriptions/${transcriptionId}`,
-        {
-          headers: {
-            'Authorization': `Bearer ${process.env.SONIOX_API_KEY}`
-          }
-        }
-      );
+    const statusResponse = await axios.get(
+  `${SONIOX_API_BASE}/transcriptions/${transcriptionId}`,
+  {
+    headers: {
+      'Authorization': `Bearer ${process.env.SONIOX_API_KEY}`
+    }
+  }
+);
 
-      status = statusResponse.data.status;
-      console.log(`Polling attempt ${attempts}: Status = ${status}`);
+status = statusResponse.data.status;
+console.log(`Polling attempt ${attempts}: Status = ${status}`);
+
+// ADD THIS: Log full response when error
+if (status === 'error') {
+  console.error('❌ SONIOX ERROR DETAILS:', JSON.stringify(statusResponse.data, null, 2));
+}
     }
 
     if (status === 'error') {
