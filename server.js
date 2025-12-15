@@ -128,12 +128,13 @@ app.post('/stt/telegram', upload.single('voice'), async (req, res) => {
 
     // 3. STEP 2: Create transcription
     console.log('Step 2: Creating transcription...');
-    const transcriptionResponse = await axios.post(
-      `${SONIOX_API_BASE}/transcriptions`,
-      {
-        model: 'stt-async-he',  // Hebrew async model
-        file_id: fileId
-      },
+const transcriptionResponse = await axios.post(
+  `${SONIOX_API_BASE}/transcriptions`,
+  {
+    model: 'stt-async-v3', 
+    file_id: fileId,
+    language: 'he'         
+  },
       {
         headers: {
           'Authorization': `Bearer ${process.env.SONIOX_API_KEY}`,
